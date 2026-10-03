@@ -40,6 +40,11 @@ function noteSolveInputChanged() {
   // 资格与在途合成资格，无需等待任何在途求解 / 合成完成。
   compositeState.epoch += 1;
   markCompositeStaleness(); // 图层 / 样本 / 关系变化也立即撤销旧合成预览的下载资格
+  // 过渡执行 / 过渡规划同样把图层、样本、关系视为参与输入：过渡纪元同步 +1
+  // （只增不减），markTransitionStaleness 会立即终止进行中的逐步确认执行，
+  // 并把已落地规划标记为过期——改回原值也不能续走或开始，须重新规划。
+  transitionState.epoch += 1;
+  markTransitionStaleness();
 }
 
 const $ = (sel) => document.querySelector(sel);
@@ -325,7 +330,8 @@ document.addEventListener("input", (e) => {
     case "transition-limit": {
       const v = parseFloat(t.value);
       transitionState.limit = t.value.trim() === "" || Number.isNaN(v) ? null : v;
-      markTransitionStaleness();
+      // 过渡上限变化属于参与输入变化：纪元 +1，立即终止执行并让旧规划过期
+      bumpTransitionEpoch();
       break;
     }
   }
@@ -954,8 +960,10 @@ document.addEventListener("change", (e) => {
     const other = transitionState.order.findIndex((id, p) => p !== pos && id === t.value);
     transitionState.order[pos] = t.value;
     if (other !== -1 && prev) transitionState.order[other] = prev;
-    renderTransitionControls(lastSolveResult);
-    markTransitionStaleness();
+    // 手动调整当前叠序属于参与输入变化：纪元 +1，立即终止进行中的执行并让
+    // 旧规划过期（已确认记录保留，输入不回滚；改回原值也不能续走）
+    bumpTransitionEpoch();
+    if (lastSolveResult) renderTransitionControls(lastSolveResult);
   } else if (act === "infer-pick") {
     const id = t.dataset.id;
     if (t.checked) inferState.picks.add(id);
@@ -989,6 +997,10 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "review-append") appendReviewSample();
   if (btn.dataset.act === "transition-run") runTransition();
   if (btn.dataset.act === "transition-reset") resetTransitionOrder();
+  if (btn.dataset.act === "transition-start") startTransitionExecution();
+  if (btn.dataset.act === "transition-confirm-step") {
+    confirmTransitionStep(Number(btn.dataset.step));
+  }
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
 });
 
@@ -1189,11 +1201,18 @@ const transitionState = {
   limit: null,      // 过渡总误差上限（null 表示沿用最近一次求解的总误差）
   result: null,     // 最近一次成功返回
   resultKey: "",    // 结果产生时的输入指纹
+  resultEpoch: 0,   // 结果落地时的过渡纪元（与当前纪元不一致即为过期规划）
   _idSig: "",
   _bestSse: null,   // 最近一次求解的最优总误差（用于默认上限与提示）
   inflightId: 0,        // 当前仍可落地的在途请求序号；0 表示无（已完成 / 被更新请求取代 / 因输入变化作废）
   inflightSig: "",      // 当前在途请求发出时的输入指纹
   reqSeq: 0,            // 单调递增的请求序号源，永不归零，避免请求序号在完成后被新请求复用
+  // 逐步确认执行：开始（含空路径直接完成）后以 result 为不可变快照，confirmedCount
+  // 为已确认步数（0..stepCount）。中断只清空 exec、不清空 confirmedCount——已确认
+  // 记录随旧规划保留展示；重新规划成功后 confirmedCount 归零、exec 清空。
+  epoch: 0,             // 过渡纪元（只增不减）：任一参与输入变化 / 重置 / 手动调序即 +1
+  exec: null,           // "running" | "completed" | null（非 null 时展示冻结快照）
+  confirmedCount: 0,
 };
 
 const elTransitionOrder = $("#transitionOrder");
@@ -1232,6 +1251,11 @@ function syncTransitionPanel(solveResult) {
     transitionState.limit = null;
     transitionState.result = null;
     transitionState.resultKey = "";
+    transitionState.resultEpoch = 0;
+    // 图层集合已变：旧执行在 noteSolveInputChanged 内已被终止，这里一并清掉
+    // 已确认计数与执行标记（新图层集合下旧步骤不再有保留意义）
+    transitionState.exec = null;
+    transitionState.confirmedCount = 0;
     elTransitionResult.innerHTML = "";
     elTransitionErrors.hidden = true;
   } else {
@@ -1302,12 +1326,23 @@ function renderTransitionControls(solveResult) {
   });
 
   // ---- 目标顺序：只读展示 ----
-  renderOrderSlots(elTransitionTarget, solveResult.order);
+  // 执行（含已完成 / 已中断）期间目标固定为开始时规划的目标，不随后续求解刷新；
+  // 非执行期间始终展示最近一次求解的最优顺序。
+  const targetOrder =
+    transitionState.exec !== null && transitionState.result
+      ? transitionState.result.targetOrder
+      : solveResult.order;
+  renderOrderSlots(elTransitionTarget, targetOrder);
 
   // ---- 上限输入：空白时默认取最优总误差 ----
-  if (transitionState.limit == null && document.activeElement !== elTransitionLimit) {
+  // 执行期间上限值固定显示开始时的有效上限（输入框禁用，中断后恢复可改）。
+  const limitActive = document.activeElement === elTransitionLimit;
+  if (transitionState.exec !== null && transitionState.result) {
+    elTransitionLimit.value = String(transitionState.result.transitionLimit);
+  } else if (transitionState.limit == null && !limitActive) {
     elTransitionLimit.value = solveResult.totalSse == null ? "" : String(solveResult.totalSse);
   }
+  elTransitionLimit.disabled = transitionState.exec === "running";
   elTransitionLimitHint.textContent =
     `留空默认取最优总误差 ${fmtSse(solveResult.totalSse)}；当前实际叠序的旧样本总误差也必须不超过该上限`;
 
@@ -1317,15 +1352,26 @@ function renderTransitionControls(solveResult) {
 function resetTransitionOrder() {
   const r = lastSolveResult;
   if (!r) return;
+  // 重置当前叠序属于「手动调整当前叠序」：过渡纪元 +1 并立即终止进行中的执行
+  // （只增不减，即使重置后的顺序恰好等于开始时的顺序也不能续走，须重新规划）。
+  bumpTransitionEpoch();
   transitionState.order = [...r.order];
   transitionState.limit = null;
   renderTransitionControls(r);
 }
 
+// 过渡参与输入（图层 / 样本 / 关系经 noteSolveInputChanged、当前叠序手动调整、
+// 过渡上限变化、重置、重新规划）变化的统一纪元入口：纪元只增不减。
+function bumpTransitionEpoch() {
+  transitionState.epoch += 1;
+  markTransitionStaleness();
+}
+
 function markTransitionStaleness() {
-  // 输入指纹变化时：在途请求（及其响应）立即失效，不能再改动结果 / 错误 / 加载状态。
-  // 这里仅结束加载态并作废在途请求；旧响应返回后会在响应守卫处被丢弃。
-  // 注意 reqSeq 不清零，请求序号始终单调递增，旧序号不会被后续请求复用。
+  // 参与输入变化（图层 / 样本 / 关系 / 当前叠序 / 上限 / 重置 / 重新规划）时：
+  // 1) 在途请求（及其响应）立即失效——指纹不再匹配，旧响应返回后在响应守卫处
+  //    被丢弃；这里仅结束加载态并作废在途请求。reqSeq 不清零，请求序号始终
+  //    单调递增，旧序号不会被后续请求复用。
   if (transitionState.inflightId !== 0 &&
       transitionSignature() !== transitionState.inflightSig) {
     transitionState.inflightId = 0;
@@ -1333,22 +1379,23 @@ function markTransitionStaleness() {
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
   }
-  if (!transitionState.result) return;
-  const fresh = transitionSignature() === transitionState.resultKey;
-  const old = elTransitionResult.querySelector(".stale-note");
-  if (!fresh && !old) {
-    const note = document.createElement("div");
-    note.className = "stale-note";
-    note.textContent = "参与规划的输入已变化，以下交换步骤已失效，请重新规划。";
-    elTransitionResult.prepend(note);
-  } else if (fresh && old) {
-    old.remove();
+  // 2) 执行中（含已完成）遇到纪元变化（纪元只增不减：修改图层 / 样本 / 关系 /
+  //    上限，手动调整或重置当前叠序，发起重新规划）：立即终止执行。exec 清空
+  //    但 confirmedCount 保留——已确认记录随旧规划继续展示；不回滚任何输入，
+  //    之后即使把输入改回原值，纪元也不回落，不能续走，必须重新规划后再开始。
+  //    确认写回当前叠序不递增纪元，因此正常确认 / 完成动作不会触发这里。
+  if (transitionState.exec !== null &&
+      transitionState.result &&
+      transitionState.epoch !== transitionState.resultEpoch) {
+    transitionState.exec = null;
+    // 中断后控件恢复可编辑：上限输入重新启用，目标切回最近求解的最优顺序。
+    // 直接做局部刷新，不调用 renderTransitionControls（其末尾会再进本函数，
+    // 虽然此时 exec 已为 null 不会循环，但会重复渲染）。
+    elTransitionLimit.disabled = false;
+    if (lastSolveResult) renderOrderSlots(elTransitionTarget, lastSolveResult.order);
   }
-}
-
-function transitionResultFresh() {
-  if (!transitionState.result) return false;
-  return transitionSignature() === transitionState.resultKey;
+  // 已落地规划 / 执行快照视图的过期与中断提示全部由 renderTransitionView 统一绘制
+  if (transitionState.result) renderTransitionView();
 }
 
 // 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地。
@@ -1364,6 +1411,10 @@ function transitionResponseCurrent(reqId, reqSig) {
 }
 
 async function runTransition() {
+  // 发起重新规划本身即「参与输入变化」：过渡纪元 +1，若有执行在进行则立即终止
+  // （旧步骤与已确认记录在本次响应落地前仍保留展示，不回滚任何输入）；
+  // 同时让上一份规划立即过期，等待本次结果替换。
+  bumpTransitionEpoch();
   const limit = effectiveTransitionLimit();
   const payload = {
     layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
@@ -1378,6 +1429,8 @@ async function runTransition() {
   transitionState.inflightId = reqId;
   const reqSig = transitionSignature();
   transitionState.inflightSig = reqSig;
+  // 规划在途期间重绘一次：开始按钮禁用（没有规划请求在等待时才能开始）
+  if (transitionState.result) renderTransitionView();
 
   elTransitionStatus.textContent = "规划中…";
   elTransitionStatus.className = "status busy";
@@ -1397,11 +1450,20 @@ async function runTransition() {
     elTransitionStatus.className = "status";
     if (!resp.ok) {
       showTransitionErrors(data.errors || [{ scope: "form", message: "规划失败" }]);
+      // 规划失败：保留旧规划展示（已过期），其已确认记录同样保留；重新开始前
+      // 必须先在当前输入下重新规划成功
+      if (transitionState.result) renderTransitionView();
       return;
     }
     transitionState.result = data;
     transitionState.resultKey = reqSig;
-    renderTransitionResult(data);
+    // 以响应落地时的当前纪元锚定：落地前的任何参与输入变化都会让纪元前进，
+    // 过期响应早已在守卫处被丢弃，因此能走到这里时纪元必然等于发出时的纪元
+    transitionState.resultEpoch = transitionState.epoch;
+    // 新规划替换旧规划：执行记录归零，等待用户点击「开始」
+    transitionState.exec = null;
+    transitionState.confirmedCount = 0;
+    renderTransitionView(data);
   } catch (err) {
     if (!transitionResponseCurrent(reqId, reqSig)) return;
     transitionState.inflightId = 0;
@@ -1409,6 +1471,7 @@ async function runTransition() {
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
     showTransitionErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+    if (transitionState.result) renderTransitionView();
   }
 }
 
@@ -1418,11 +1481,127 @@ function showTransitionErrors(errors) {
   elTransitionErrors.hidden = false;
 }
 
-function renderTransitionResult(r) {
+// ------------------------------------------------ 过渡：逐步确认执行 --
+
+// 只有「规划有效、可达、当前没有执行在进行、且没有规划请求在途」时才允许开始
+function transitionCanStart(r) {
+  return !!(
+    r &&
+    r.reachable &&
+    transitionState.epoch === transitionState.resultEpoch &&
+    transitionState.exec === null &&
+    transitionState.inflightId === 0
+  );
+}
+
+function startTransitionExecution() {
+  const r = transitionState.result;
+  if (!transitionCanStart(r)) return;
+  // 以返回时的规划为不可变快照：起点叠序、目标、有效上限与步骤均固定，
+  // 执行期间修改任何输入都不会改动这里展示的内容。
+  if (r.alreadyTarget) {
+    // 空路径直接完成：仍按「开始过」处理，标记为已完成，不能再次开始，
+    // 需重新规划（或输入变化后重新规划）才能再次开始。
+    transitionState.exec = "completed";
+    transitionState.confirmedCount = 0;
+    renderTransitionControls(lastSolveResult);
+    renderTransitionView();
+    return;
+  }
+  transitionState.exec = "running";
+  transitionState.confirmedCount = 0;
+  // 开始执行不改变任何输入，因此不递增纪元；控件随之冻结（上限禁用等）
+  renderTransitionControls(lastSolveResult);
+  renderTransitionView();
+}
+
+function confirmTransitionStep(stepNo) {
+  const r = transitionState.result;
+  if (transitionState.exec !== "running" ||
+      transitionState.epoch !== transitionState.resultEpoch ||
+      !r || !r.reachable) {
+    return;
+  }
+  // 只有「下一个待确认步」可确认：按钮已据此禁用，这里再核对一次，
+  // 保证重复确认同一步只计一次（已确认 / 未来步的按钮一律忽略）。
+  if (stepNo !== transitionState.confirmedCount + 1) return;
+  const st = r.steps[transitionState.confirmedCount];
+  if (!st || st.step !== stepNo) return;
+
+  // 把该步交换后的叠序写回「当前实际叠序」控件（transitionState.order）。
+  // 这是对确认动作的程序性写回，不经过手动调序入口，因此不递增过渡纪元、
+  // 不终止执行；随后推进确认计数，余下执行步骤仍可用。
+  transitionState.order = [...st.order];
+  transitionState.confirmedCount = stepNo;
+  if (stepNo >= r.stepCount) transitionState.exec = "completed";
+  renderTransitionControls(lastSolveResult);
+  renderTransitionView();
+}
+
+function renderTransitionView(provided) {
+  const r = provided || transitionState.result;
+  if (!r) {
+    elTransitionResult.innerHTML = "";
+    return;
+  }
   elTransitionErrors.hidden = true;
-  let html = `
+  const fresh = transitionState.epoch === transitionState.resultEpoch;
+  const mode = transitionState.exec; // "running" | "completed" | null
+  const confirmed = transitionState.confirmedCount;
+  const total = r.stepCount;
+
+  let html = "";
+
+  // ---- 状态横幅：执行进度 / 完成 / 中断 / 规划过期 ----
+  if (mode === "running") {
+    const next = r.steps[confirmed];
+    const curIds = confirmed === 0 ? r.currentOrder : r.steps[confirmed - 1].order;
+    html += `
+      <div class="trans-exec-panel">
+        <div class="trans-progress">
+          已完成 <b>${confirmed}</b> / ${total} 步
+          <span class="trans-progress-bar">
+            <span style="width:${total ? (confirmed / total) * 100 : 100}%"></span>
+          </span>
+        </div>
+        <div class="trans-current-line">
+          当前实际叠序（底 → 顶）：<b class="hexval">${curIds.map(escapeHtml).join(" ↑ ")}</b>
+        </div>
+        ${next
+          ? `<div class="trans-next-line">
+               下一次交换：第 ${next.step} 步，相邻两层
+               <b class="hexval">${escapeHtml(next.swappedLowerId)}</b>
+               <span class="hint">（下）⇅</span>
+               <b class="hexval">${escapeHtml(next.swappedUpperId)}</b>
+               <span class="hint">（上）</span>；交换后
+               <b class="hexval">${next.order.map(escapeHtml).join(" ↑ ")}</b>
+             </div>`
+          : ""}
+      </div>`;
+  } else if (mode === "completed") {
+    html += `
+      <div class="trans-done-banner">
+        ${total === 0
+          ? "空路径：当前实际叠序就是目标最优叠序，已直接完成（0 步交换）。"
+          : `全部 ${total} 步已确认完成，当前实际叠序已调整为目标最优叠序。`}
+      </div>`;
+  } else if (confirmed > 0) {
+    // 执行曾开始、已被中断：保留已确认记录与输入，不回滚
+    html += `
+      <div class="stale-note trans-abort-note">
+        执行已中断：已确认 ${confirmed} / ${total} 步的记录保留，当前叠序等输入不回滚；
+        修改图层、样本、关系、过渡上限，手动调整 / 重置当前叠序或重新规划后，改回原值也不能续走，
+        须重新规划后再开始。
+      </div>`;
+  } else if (!fresh) {
+    html += `
+      <div class="stale-note">参与规划的输入已变化，以下交换步骤已失效，请重新规划后再开始。</div>`;
+  }
+
+  // ---- 指标 ----
+  html += `
     <div class="metric-row">
-      <span>当前总误差：<b>${fmtSse(r.currentTotalSse)}</b></span>
+      <span>起点总误差：<b>${fmtSse(r.currentTotalSse)}</b></span>
       <span>目标总误差：<b>${fmtSse(r.targetTotalSse)}</b></span>
       <span>过渡总误差上限：<b>${fmtSse(r.transitionLimit)}</b></span>
       <span>合规叠序：<b>${r.feasibleCount}</b> 条</span>
@@ -1432,49 +1611,86 @@ function renderTransitionResult(r) {
 
   if (r.alreadyTarget) {
     html += `
-      <div class="suggest-none">当前实际叠序就是目标最优叠序，无需交换（0 步）。</div>`;
-    elTransitionResult.innerHTML = html;
-    return;
-  }
-
-  if (!r.reachable) {
+      <div class="suggest-none">规划起点叠序就是目标最优叠序，无需交换（0 步）。</div>`;
+  } else if (!r.reachable) {
     html += `
       <div class="review-incompat">目标叠序不可到达：${escapeHtml(r.message)}</div>`;
-    elTransitionResult.innerHTML = html;
-    return;
+  } else {
+    html += `
+      <div class="suggest-sec-title">
+        最少交换 <b>${total}</b> 步
+        （并列时按每步交换前「下方 ID, 上方 ID」对的字典序决胜；访问状态 ${r.statesVisited} 个）
+      </div>`;
   }
 
-  html += `
-    <div class="suggest-sec-title">
-      最少交换 <b>${r.stepCount}</b> 步
-      （并列时按每步交换前「下方 ID, 上方 ID」对的字典序决胜；访问状态 ${r.statesVisited} 个）
-    </div>`;
+  // ---- 开始 / 执行说明行 ----
+  if (r.alreadyTarget || r.reachable) {
+    let startDisabled = true;
+    let startHint = "";
+    if (mode === "running") {
+      startHint = "执行进行中：请在下方逐步确认，执行期间不能再次开始";
+    } else if (mode === "completed") {
+      startHint = total === 0
+        ? "空路径已直接完成；如需再次执行请重新规划"
+        : "全部步骤已确认完成；如需再次执行请重新规划";
+    } else if (transitionState.inflightId !== 0) {
+      startHint = "规划请求在途，待规划完成后才能开始";
+    } else if (!fresh) {
+      startHint = "规划已过期（参与输入已变化），请重新规划后再开始";
+    } else {
+      startDisabled = false;
+      startHint = total === 0
+        ? "空路径：点击开始后直接标记为完成"
+        : "固定使用下方的起点叠序、目标、有效上限与步骤；开始后请逐步确认每一次交换";
+    }
+    html += `
+      <div class="infer-actions trans-start-row">
+        <button class="btn btn-small" data-act="transition-start" type="button"
+                ${startDisabled ? "disabled" : ""}>
+          ${total === 0 ? "开始（空路径，直接完成）" : "开始逐步确认"}
+        </button>
+        <span class="hint">${escapeHtml(startHint)}</span>
+      </div>`;
+  }
 
-  // 起点（第 0 步）
-  html += `<div class="transition-steps">`;
-  html += renderTransitionStateBlock("起点", null, r.currentOrder, r.currentTotalSse, r.currentSamples);
-
-  r.steps.forEach((st) => {
+  // ---- 起点与各步（空路径 / 不可达时不展示步骤列表）----
+  if (!r.alreadyTarget && r.reachable) {
+    html += `<div class="transition-steps">`;
     html += renderTransitionStateBlock(
-      `第 ${st.step} 步`,
-      st,
-      st.order,
-      st.totalSse,
-      st.samples
+      r, null, "起点", r.currentOrder, r.currentTotalSse, r.currentSamples,
+      { mode, confirmed, fresh }
     );
-  });
-  html += `</div>`;
+    r.steps.forEach((st) => {
+      html += renderTransitionStateBlock(
+        r, st, `第 ${st.step} 步`, st.order, st.totalSse, st.samples,
+        { mode, confirmed, fresh }
+      );
+    });
+    html += `</div>`;
+  }
+
   elTransitionResult.innerHTML = html;
 }
 
-function renderTransitionStateBlock(tag, step, order, totalSse, samples) {
+function renderTransitionStateBlock(r, step, tag, order, totalSse, samples, opts) {
+  const { mode, confirmed } = opts;
+  const stepNo = step ? step.step : 0;
+  const isDone = step !== null && mode !== null && stepNo <= confirmed;
+  const isNext = step !== null && mode === "running" && stepNo === confirmed + 1;
+  const stepCls =
+    (step ? " is-step" : " is-start") +
+    (isDone ? " is-done" : "") +
+    (isNext ? " is-next" : "");
+
   const chips = order
     .map((id) => {
       const layer = layerById(id);
       const hex = (layer && normalizeHex(layer.color)) || "#000000";
       const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
       const swapped =
-        step && (id === step.swappedLowerId || id === step.swappedUpperId) ? " swapped" : "";
+        step && (id === step.swappedLowerId || id === step.swappedUpperId)
+          ? " swapped"
+          : "";
       return `
         <span class="chip${swapped}">
           <span class="dot" style="background:${hexToRgba(hex, op)}" title="${escapeHtml(id)}"></span>
@@ -1495,26 +1711,64 @@ function renderTransitionStateBlock(tag, step, order, totalSse, samples) {
           <span class="hint">（上）</span>
         </span>
         <span class="spacer"></span>
-        <span class="review-meas">总误差 <b>${fmtSse(totalSse)}</b></span>
+        <span class="review-meas">交换后总误差 <b>${fmtSse(totalSse)}</b></span>
       </div>`;
   } else {
     head = `
       <div class="trans-step-head">
         <span class="trans-step-tag start">${tag}</span>
-        <span class="hint">调整前叠序</span>
+        <span class="hint">调整前叠序（开始后固定）</span>
         <span class="spacer"></span>
         <span class="review-meas">总误差 <b>${fmtSse(totalSse)}</b></span>
       </div>`;
   }
 
+  // ---- 每步确认区：仅执行相关状态展示；重复确认同一步只计一次 ----
+  let foot = "";
+  if (step) {
+    if (mode === "running" && isDone) {
+      foot = `
+        <div class="trans-step-foot">
+          <span class="trans-checked-badge">✓ 已确认（第 ${stepNo} 步）</span>
+          <span class="hint">交换后叠序已写回上方「当前实际叠序」控件</span>
+        </div>`;
+    } else if (mode === "running" && isNext) {
+      foot = `
+        <div class="trans-step-foot">
+          <button class="btn btn-small" data-act="transition-confirm-step"
+                  data-step="${stepNo}" type="button">
+            确认第 ${stepNo} 步交换
+          </button>
+          <span class="hint">确认后把交换后的叠序写回「当前实际叠序」并推进到下一步</span>
+        </div>`;
+    } else if (mode === "running") {
+      foot = `
+        <div class="trans-step-foot">
+          <button class="btn btn-small" disabled type="button">第 ${stepNo} 步（待前序步骤确认）</button>
+        </div>`;
+    } else if (mode === "completed") {
+      foot = `
+        <div class="trans-step-foot">
+          <span class="trans-checked-badge">✓ 已确认（第 ${stepNo} 步）</span>
+        </div>`;
+    } else if (mode === null && confirmed >= stepNo) {
+      // 中断后保留的已确认记录
+      foot = `
+        <div class="trans-step-foot">
+          <span class="trans-checked-badge">✓ 已确认（第 ${stepNo} 步，执行已中断）</span>
+        </div>`;
+    }
+  }
+
   const sampleHtml = samples.map(renderSample).join("");
   return `
-    <div class="trans-step">
+    <div class="trans-step${stepCls}">
       ${head}
       <div class="checker"><div class="order-chips">
         <span class="order-ends">底</span>${chips}<span class="order-ends">↑ 顶</span>
       </div></div>
       ${sampleHtml}
+      ${foot}
     </div>`;
 }
 

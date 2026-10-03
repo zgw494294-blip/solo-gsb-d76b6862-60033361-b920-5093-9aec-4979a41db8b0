@@ -566,6 +566,77 @@ a.btn.composite-download.is-disabled {
 }
 .chip.swapped .cid { color: var(--accent); font-weight: 600; }
 
+/* 逐步确认执行 */
+.trans-exec-panel {
+  margin: 8px 0 10px;
+  border: 1px solid #d6d9fb;
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+.trans-progress { display: flex; align-items: center; gap: 10px; }
+.trans-progress b { color: var(--accent); font-size: 14px; }
+.trans-progress-bar {
+  position: relative;
+  flex: 1;
+  max-width: 220px;
+  height: 8px;
+  border-radius: 999px;
+  background: #e3e6fb;
+  overflow: hidden;
+}
+.trans-progress-bar span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.15s ease;
+}
+.trans-current-line b, .trans-next-line b { font-weight: 600; }
+.trans-next-line { color: var(--ink); }
+.trans-done-banner {
+  margin: 8px 0 10px;
+  font-size: 13px;
+  color: #166534;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.trans-abort-note {
+  display: block;
+  margin: 8px 0 10px;
+  border: 1px solid #f3d9a4;
+  background: #fffbeb;
+  border-radius: 8px;
+  padding: 8px 12px;
+  line-height: 1.6;
+}
+.trans-start-row { margin: 10px 0 4px; }
+.trans-step-foot {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.trans-checked-badge {
+  font-size: 12px;
+  color: var(--ok);
+  font-weight: 600;
+}
+.trans-step.is-done { background: #f7fdf9; border-color: #c7ecd4; }
+.trans-step.is-next {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
 /* ------------------------- 下一次背景测量建议 ------------------------- */
 .suggest-card { margin-top: 16px; }
 .suggest-cand-actions { margin-top: 8px; }
