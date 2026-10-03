@@ -566,6 +566,89 @@ a.btn.composite-download.is-disabled {
 }
 .chip.swapped .cid { color: var(--accent); font-weight: 600; }
 
+/* ------------------------- 过渡执行（逐步确认） ------------------------- */
+.exec-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 12px;
+  background: #fbfcfe;
+}
+.exec-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.exec-head b { color: var(--ink); }
+.exec-tag { border-radius: 999px; padding: 1px 12px; font-size: 12px; }
+.exec-tag-active { background: var(--accent); color: #fff; }
+.exec-tag-done { background: var(--ok); color: #fff; }
+.exec-tag-terminated { background: #fff; color: var(--danger); border: 1px solid var(--danger); }
+.exec-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-top: 8px;
+}
+.exec-row .exec-chips { flex: 0 1 auto; }
+.exec-next-row { font-size: 13px; }
+.exec-next-row b { color: var(--ink); }
+.exec-swap-arrow { color: var(--ink-soft); padding: 0 2px; }
+.exec-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+}
+.exec-step-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 8px;
+  background: #fff;
+}
+.exec-step-row.exec-step-current { border-color: var(--accent); background: var(--accent-soft); }
+.exec-step-row.exec-step-confirmed { background: #f8fbf9; }
+.exec-step-status {
+  border-radius: 999px;
+  padding: 0 10px;
+  font-size: 11px;
+  background: #f5f6fb;
+  color: var(--ink-soft);
+  flex: none;
+}
+.exec-step-current .exec-step-status { background: var(--accent); color: #fff; }
+.exec-step-confirmed .exec-step-status {
+  background: #f0fdf4;
+  color: var(--ok);
+  border: 1px solid #bbf7d0;
+}
+.exec-step-start .exec-step-status {
+  background: #fff;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+.exec-step-order { font-size: 12px; }
+.exec-terminated-note {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #991b1b;
+  background: var(--danger-soft);
+  border: 1px solid #f3c2c2;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.exec-start-row { margin-top: 12px; }
+
 /* ------------------------- 下一次背景测量建议 ------------------------- */
 .suggest-card { margin-top: 16px; }
 .suggest-cand-actions { margin-top: 8px; }

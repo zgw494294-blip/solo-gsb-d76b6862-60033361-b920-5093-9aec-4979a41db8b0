@@ -948,6 +948,8 @@ document.addEventListener("change", (e) => {
     if (other !== -1 && prev) inferState.order[other] = prev;
     renderInferControls();
   } else if (act === "transition-order") {
+    // 手动调整当前叠序：立即终止旧执行（已确认记录保留，输入不回滚）
+    terminateTransitionExecution("order");
     const pos = Number(t.dataset.pos);
     const prev = orderSlotBefore;
     // 与原占据新 ID 的槽位交换，保证当前顺序始终是全部图层的一个排列
@@ -989,6 +991,8 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "review-append") appendReviewSample();
   if (btn.dataset.act === "transition-run") runTransition();
   if (btn.dataset.act === "transition-reset") resetTransitionOrder();
+  if (btn.dataset.act === "transition-exec-start") startTransitionExecution();
+  if (btn.dataset.act === "transition-exec-confirm") confirmTransitionStep(Number(btn.dataset.step));
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
 });
 
@@ -1194,23 +1198,31 @@ const transitionState = {
   inflightId: 0,        // 当前仍可落地的在途请求序号；0 表示无（已完成 / 被更新请求取代 / 因输入变化作废）
   inflightSig: "",      // 当前在途请求发出时的输入指纹
   reqSeq: 0,            // 单调递增的请求序号源，永不归零，避免请求序号在完成后被新请求复用
+  exec: null,           // 当前过渡执行会话（见 startTransitionExecution）；null 表示未开始 / 已被新规划取代
 };
 
 const elTransitionOrder = $("#transitionOrder");
 const elTransitionTarget = $("#transitionTarget");
 const elTransitionResult = $("#transitionResult");
+const elTransitionExec = $("#transitionExec");
 const elTransitionErrors = $("#transitionErrors");
 const elTransitionStatus = $("#transitionStatus");
 const elTransitionLimit = $("#transitionLimit");
 const elTransitionLimitHint = $("#transitionLimitHint");
 
 function transitionSignature() {
-  // 用于判断已有过渡步骤是否对应当前输入
+  // 用于判断已有过渡步骤是否对应当前输入。
+  // 执行会话激活期间，「当前实际叠序」按启动时冻结的起始叠序计入指纹：
+  // 确认步骤会把该步叠序写回当前叠序控件，这种执行写回不视为输入变化——
+  // 不会让规划结果失效、也不会终止执行；手动调整 / 重置当前叠序则由对应
+  // 事件处理显式终止执行（见 transition-order / transition-reset）。
+  const exec = transitionState.exec;
+  const execActive = exec && !exec.terminated && !exec.done;
   return JSON.stringify({
     layers: state.layers,
     samples: state.samples,
     relations: state.relations,
-    currentOrder: transitionState.order,
+    currentOrder: execActive ? exec.startOrder : transitionState.order,
     transitionLimit: transitionState.limit == null ? null : transitionState.limit,
   });
 }
@@ -1317,12 +1329,24 @@ function renderTransitionControls(solveResult) {
 function resetTransitionOrder() {
   const r = lastSolveResult;
   if (!r) return;
+  // 手动重置当前叠序：立即终止旧执行（已确认记录保留，输入不回滚）
+  terminateTransitionExecution("order");
   transitionState.order = [...r.order];
   transitionState.limit = null;
   renderTransitionControls(r);
 }
 
 function markTransitionStaleness() {
+  // 执行会话的终止判定：图层 / 样本 / 先后关系 / 过渡上限一旦偏离启动时冻结的
+  // 指纹，立即终止旧执行——终止是永久的，改回原值也不能续走，须重新规划后开始。
+  // （执行中「当前实际叠序」按冻结的起始叠序计入指纹，确认步骤的写回不算偏离；
+  //   手动调整 / 重置当前叠序、重新发起规划由对应入口显式终止。）
+  const exec = transitionState.exec;
+  if (exec && !exec.terminated && !exec.done &&
+      transitionSignature() !== exec.signature) {
+    exec.terminated = true;
+    exec.terminateReason = "input";
+  }
   // 输入指纹变化时：在途请求（及其响应）立即失效，不能再改动结果 / 错误 / 加载状态。
   // 这里仅结束加载态并作废在途请求；旧响应返回后会在响应守卫处被丢弃。
   // 注意 reqSeq 不清零，请求序号始终单调递增，旧序号不会被后续请求复用。
@@ -1333,17 +1357,19 @@ function markTransitionStaleness() {
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
   }
-  if (!transitionState.result) return;
-  const fresh = transitionSignature() === transitionState.resultKey;
-  const old = elTransitionResult.querySelector(".stale-note");
-  if (!fresh && !old) {
-    const note = document.createElement("div");
-    note.className = "stale-note";
-    note.textContent = "参与规划的输入已变化，以下交换步骤已失效，请重新规划。";
-    elTransitionResult.prepend(note);
-  } else if (fresh && old) {
-    old.remove();
+  if (transitionState.result) {
+    const fresh = transitionSignature() === transitionState.resultKey;
+    const old = elTransitionResult.querySelector(".stale-note");
+    if (!fresh && !old) {
+      const note = document.createElement("div");
+      note.className = "stale-note";
+      note.textContent = "参与规划的输入已变化，以下交换步骤已失效，请重新规划。";
+      elTransitionResult.prepend(note);
+    } else if (fresh && old) {
+      old.remove();
+    }
   }
+  renderTransitionExec();
 }
 
 function transitionResultFresh() {
@@ -1364,6 +1390,9 @@ function transitionResponseCurrent(reqId, reqSig) {
 }
 
 async function runTransition() {
+  // 发起重新规划：立即终止旧执行（已确认记录保留展示，输入不回滚，
+  // 改回原值也不能续走；新规划成功落地后才允许再次开始执行）
+  terminateTransitionExecution("replan");
   const limit = effectiveTransitionLimit();
   const payload = {
     layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
@@ -1382,6 +1411,7 @@ async function runTransition() {
   elTransitionStatus.textContent = "规划中…";
   elTransitionStatus.className = "status busy";
   elTransitionErrors.hidden = true;
+  renderTransitionExec(); // 规划请求在途期间禁止开始执行
 
   try {
     const resp = await fetch("/api/plan-transition", {
@@ -1397,11 +1427,15 @@ async function runTransition() {
     elTransitionStatus.className = "status";
     if (!resp.ok) {
       showTransitionErrors(data.errors || [{ scope: "form", message: "规划失败" }]);
+      renderTransitionExec();
       return;
     }
     transitionState.result = data;
     transitionState.resultKey = reqSig;
+    // 新规划落地：旧执行（含已终止的记录）随之结束，等待用户重新开始
+    transitionState.exec = null;
     renderTransitionResult(data);
+    renderTransitionExec();
   } catch (err) {
     if (!transitionResponseCurrent(reqId, reqSig)) return;
     transitionState.inflightId = 0;
@@ -1409,6 +1443,7 @@ async function runTransition() {
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
     showTransitionErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+    renderTransitionExec();
   }
 }
 
@@ -1515,6 +1550,215 @@ function renderTransitionStateBlock(tag, step, order, totalSse, samples) {
         <span class="order-ends">底</span>${chips}<span class="order-ends">↑ 顶</span>
       </div></div>
       ${sampleHtml}
+    </div>`;
+}
+
+// ---------------------------------------------------------- 过渡执行（逐步确认） --
+//
+// 执行会话只保存在当前页面内存中（刷新即清空），不持久化。开始执行时固定起始
+// 叠序、目标叠序、有效上限与全部步骤（快照）；确认步骤把该步叠序写回当前叠序
+// 控件并推进。图层 / 样本 / 先后关系 / 过渡上限变化、手动调整或重置当前叠序、
+// 重新发起规划都会立即终止会话：已确认记录保留展示、输入不回滚，改回原值也
+// 不能续走，必须重新规划后才能开始新的执行。
+
+// 终止当前执行会话（若有且仍在进行）：已确认记录保留展示，输入不回滚；
+// 一旦终止即不可续走（改回原值也一样），须重新规划后开始新的执行。
+function terminateTransitionExecution(reason) {
+  const exec = transitionState.exec;
+  if (!exec || exec.terminated || exec.done) return; // 已完成 / 已终止的不重复处理
+  exec.terminated = true;
+  exec.terminateReason = reason;
+  renderTransitionExec();
+}
+
+// 开始执行：仅当「当前规划有效、可达且没有规划请求在等待」时可用；
+// 执行期间（未终止也未完成）不能再次开始；已终止的执行必须重新规划后才可再开始。
+function startTransitionExecution() {
+  const r = transitionState.result;
+  if (!r || !transitionResultFresh() || !r.reachable) return;
+  if (transitionState.inflightId !== 0) return;
+  const prev = transitionState.exec;
+  if (prev && !prev.done) return;
+  const steps = Array.isArray(r.steps) ? r.steps : [];
+  // 登记前计算指纹：此时无激活执行，签名使用实时当前叠序（即起始叠序）
+  const signature = transitionSignature();
+  transitionState.exec = {
+    startOrder: [...r.currentOrder],  // 固定起始叠序
+    targetOrder: [...r.targetOrder],  // 固定目标叠序
+    limit: r.transitionLimit,         // 固定有效上限
+    steps: steps.map((st) => ({       // 固定执行步骤
+      step: st.step,
+      swappedLowerId: st.swappedLowerId,
+      swappedUpperId: st.swappedUpperId,
+      order: [...st.order],
+      totalSse: st.totalSse,
+    })),
+    confirmedCount: 0,                // 已确认（完成）步数
+    done: steps.length === 0,         // 空路径直接完成
+    terminated: false,
+    terminateReason: "",
+    signature,
+  };
+  renderTransitionExec();
+}
+
+// 确认当前一步：把该步交换后的叠序写回原「当前实际叠序」控件并推进；
+// 只能按顺序确认当前步，同一步重复确认只计一次；全部确认后标为完成。
+function confirmTransitionStep(k) {
+  const exec = transitionState.exec;
+  if (!exec || exec.terminated || exec.done) return;
+  if (k !== exec.confirmedCount) return; // 已确认过的步再确认只计一次（忽略）
+  const step = exec.steps[k];
+  if (!step) return;
+  exec.confirmedCount += 1;
+  if (exec.confirmedCount >= exec.steps.length) exec.done = true;
+  // 执行写回不视为手动调整，不终止执行（指纹中叠序已冻结）；余下执行步骤仍可用
+  transitionState.order = [...step.order];
+  renderTransitionControls(lastSolveResult || { order: exec.targetOrder, totalSse: exec.limit });
+  renderTransitionExec();
+}
+
+// 渲染执行区：无执行记录时只显示「开始执行」控制；有执行记录时显示执行面板
+function renderTransitionExec() {
+  const r = transitionState.result;
+  const exec = transitionState.exec;
+  if (!exec && !r) {
+    elTransitionExec.innerHTML = "";
+    return;
+  }
+  let html = exec ? renderTransitionExecPanel(exec) : "";
+  // 开始控制：未开始过、或上次执行已完成时可出现；已终止的执行须重新规划
+  // （新规划落地会清空执行记录）后才允许再开始
+  if (r && (!exec || exec.done)) {
+    const busy = transitionState.inflightId !== 0;
+    const fresh = transitionResultFresh();
+    const canStart = fresh && r.reachable && !busy;
+    let hint;
+    if (busy) hint = "规划请求进行中，待其返回后才能开始";
+    else if (!fresh) hint = "当前规划已失效，不能开始，请重新规划";
+    else if (!r.reachable) hint = "目标叠序不可到达，不能开始执行";
+    else if (exec && exec.done) hint = "本次执行已完成；再次开始将重新固定起始叠序、目标、上限与步骤";
+    else if (r.stepCount === 0) hint = "当前已是目标叠序：空路径，开始后将直接完成";
+    else hint = `将固定起始叠序、目标、有效上限与 ${r.stepCount} 步交换路径，逐步确认执行`;
+    html += `
+      <div class="infer-actions exec-start-row">
+        <button class="btn btn-small" data-act="transition-exec-start" type="button"
+                ${canStart ? "" : "disabled"}>开始执行</button>
+        <span class="hint">${hint}</span>
+      </div>`;
+  }
+  elTransitionExec.innerHTML = html;
+}
+
+function execTerminateReasonText(reason) {
+  return {
+    input: "图层、样本、先后关系或过渡上限已变化",
+    order: "当前实际叠序被手动调整或重置",
+    replan: "已发起重新规划",
+  }[reason] || "参与规划的输入已变化";
+}
+
+function execOrderChips(ids) {
+  const chips = ids
+    .map((id) => {
+      const layer = layerById(id);
+      const hex = (layer && normalizeHex(layer.color)) || "#000000";
+      const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
+      return `
+        <span class="chip">
+          <span class="dot" style="background:${hexToRgba(hex, op)}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+  return `<span class="checker exec-chips"><span class="order-chips">` +
+    `<span class="order-ends">底</span>${chips}<span class="order-ends">↑ 顶</span></span></span>`;
+}
+
+function renderTransitionExecPanel(exec) {
+  const total = exec.steps.length;
+  const doneN = exec.confirmedCount;
+  const tag = exec.terminated ? "已终止" : exec.done ? "已完成" : "执行中";
+  const tagCls = exec.terminated ? "exec-tag-terminated" : exec.done ? "exec-tag-done" : "exec-tag-active";
+
+  // 下一次交换（仅执行中有）
+  let nextHtml;
+  if (exec.terminated) {
+    nextHtml = '<span class="hint">执行已终止，无下一次交换</span>';
+  } else if (exec.done) {
+    nextHtml = `<span class="hint">无剩余交换：全部 ${total} 步已确认</span>`;
+  } else {
+    const st = exec.steps[doneN];
+    nextHtml = `
+      <span>下一次交换：第 <b>${doneN + 1}</b> 步 — 交换
+        <b class="hexval">${escapeHtml(st.swappedLowerId)}</b><span class="hint">（下）</span>
+        <span class="exec-swap-arrow">⇅</span>
+        <b class="hexval">${escapeHtml(st.swappedUpperId)}</b><span class="hint">（上）</span>
+      </span>
+      <button class="btn btn-small" data-act="transition-exec-confirm" data-step="${doneN}"
+              type="button">确认当前一步</button>`;
+  }
+
+  const stepRows = exec.steps
+    .map((st, k) => {
+      const confirmed = k < doneN;
+      const isCurrent = !exec.terminated && !exec.done && k === doneN;
+      const cls = confirmed ? "exec-step-confirmed" : isCurrent ? "exec-step-current" : "exec-step-pending";
+      const statusTxt = confirmed ? "已确认" : isCurrent ? "当前步" : "待确认";
+      const confirmBtn = isCurrent
+        ? `<button class="btn btn-small" data-act="transition-exec-confirm" data-step="${k}"
+                   type="button">确认此步</button>`
+        : "";
+      return `
+        <div class="exec-step-row ${cls}">
+          <span class="exec-step-status">${statusTxt}</span>
+          <span>第 ${k + 1} 步：交换
+            <b class="hexval">${escapeHtml(st.swappedLowerId)}</b><span class="hint">（下）</span>
+            <span class="exec-swap-arrow">⇅</span>
+            <b class="hexval">${escapeHtml(st.swappedUpperId)}</b><span class="hint">（上）</span>
+          </span>
+          <span class="exec-step-order hexval">${st.order.map(escapeHtml).join(" ↑ ")}</span>
+          <span class="hint">总误差 ${fmtSse(st.totalSse)}</span>
+          <span class="spacer"></span>
+          ${confirmBtn}
+        </div>`;
+    })
+    .join("");
+
+  const terminatedNote = exec.terminated
+    ? `<div class="exec-terminated-note">
+        执行已终止（${execTerminateReasonText(exec.terminateReason)}）。已确认记录保留如上，
+        图层、样本、上限与当前叠序等输入均未回滚；即使改回原值也不能续走，须重新规划后开始新的执行。
+      </div>`
+    : "";
+
+  return `
+    <div class="exec-panel">
+      <div class="exec-head">
+        <span class="exec-tag ${tagCls}">${tag}</span>
+        <span>已完成 <b>${doneN}</b> / <b>${total}</b> 步</span>
+        <span>有效上限 <b>${fmtSse(exec.limit)}</b></span>
+      </div>
+      <div class="exec-row">
+        <span class="hint">当前实际叠序（与上方当前叠序控件同步）：</span>
+        ${execOrderChips(transitionState.order)}
+      </div>
+      <div class="exec-row exec-next-row">${nextHtml}</div>
+      <div class="exec-row">
+        <span class="hint">固定起始叠序：</span>${execOrderChips(exec.startOrder)}
+      </div>
+      <div class="exec-row">
+        <span class="hint">固定目标叠序：</span>${execOrderChips(exec.targetOrder)}
+      </div>
+      <div class="exec-steps">
+        <div class="exec-step-row exec-step-start">
+          <span class="exec-step-status">起点</span>
+          <span class="exec-step-order hexval">${exec.startOrder.map(escapeHtml).join(" ↑ ")}</span>
+          <span class="hint">起始叠序（第 0 步，未交换）</span>
+        </div>
+        ${stepRows}
+      </div>
+      ${terminatedNote}
     </div>`;
 }
 
